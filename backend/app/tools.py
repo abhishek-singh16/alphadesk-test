@@ -55,7 +55,7 @@ def get_quotes(ticker: str) -> dict:
     "Live Quote for a stock ticker."
     try:
         info = yf.Ticker(ticker).fast_info
-        price, prev = info["_last_price"], info["previousClose"]
+        price, prev = info["lastPrice"], info["previousClose"]
         return {
             "ticker": ticker,
             "price": round(price, 2),
