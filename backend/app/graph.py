@@ -27,6 +27,11 @@ from typing_extensions import TypedDict
 from .llm import SYSTEM_PROMPT  # the Session 01 prompt survives the rearchitecture
 from .tools import MARKET_TOOLS, search_filings
 
+from .eval import (
+    evaluate_answer_with_llm,
+    evaluate_search_recall,
+)
+
 
 class DeskState(TypedDict):
     # `add_messages` is a reducer: what a node returns is *appended* to the
@@ -38,7 +43,9 @@ class DeskState(TypedDict):
     # Plain fields (no reducer) are *replaced* on write — but they still
     # persist across turns in the checkpoint, so the router clears this one.
     sources: list
-
+    eval_relevant: list
+    evaluation: dict
+    tool_results: list
 
 class RouteDecision(BaseModel):
     """Structured output for the router: the model must pick a label, not prose."""
@@ -87,6 +94,8 @@ def router(state: DeskState) -> dict:
         "route": decision.route,
         "clarifying_question": decision.clarifying_question,
         "sources": [],
+        "eval_relevant": state.get("eval_relevant", []),
+        "evaluation": state.get("evaluation", {}),
     }
 
 
@@ -133,9 +142,9 @@ def retrieve(state: DeskState) -> dict:
     query = state["messages"][-1].content
     hits = search_filings(query, k=10)
     sources = rerank(query, hits) if RERANK_ENABLED and hits else hits[:4]
+    #state["eval_relevant"] = benchmark["relevant"]
+    
     if sources:
-        # The frontend numbers its citation chips from this event; respond()
-        # below is instructed to cite with the same numbers. One vocabulary.
         get_stream_writer()(
             {
                 "type": "citations",
@@ -145,7 +154,25 @@ def retrieve(state: DeskState) -> dict:
                 ],
             }
         )
-    return {"sources": sources}
+
+    retrieval_eval = {}
+    print("eval_relevant =", state.get("eval_relevant"))
+    retrieval_eval = evaluate_search_recall(
+        sources,
+        state.get("eval_relevant", []),
+        k=4,
+    )
+
+    get_stream_writer()({
+        "type": "evaluation",
+        "kind": "retrieval",
+        "metrics": retrieval_eval,
+    })
+
+    return {
+        "sources": sources,
+        "evaluation": {**state.get("evaluation", {}), "retrieval": retrieval_eval},
+    }
 
 
 GROUNDED_RULES = (
@@ -167,11 +194,9 @@ def respond(state: DeskState) -> dict:
     model = llm
     if state["route"] == "market":
         model = llm.bind_tools(MARKET_TOOLS)
-        #bind_tools attach all of tools JSON schema to the request.
-        #Function calling protocol is not magic it's literally binding the tools to the model request.
+
     announce("respond")
-    # 'market' lands here un-augmented for now: the routing skeleton comes
-    # before the capability (live tools arrive in Session 04).
+
     system = SYSTEM_PROMPT
     if state["route"] == "filings":
         if state.get("sources"):
@@ -182,20 +207,94 @@ def respond(state: DeskState) -> dict:
             system = f"{SYSTEM_PROMPT}\n\n{GROUNDED_RULES}\n\nSOURCES:\n{numbered}"
         else:
             system = f"{SYSTEM_PROMPT}\n\n{NO_SOURCES_NOTE}"
+
     reply = model.invoke([("system", system), *state["messages"]])
-    return {"messages": [reply]}
+    if reply.tool_calls:
+        return {
+        "messages": [reply]
+    }
+
+    answer_text = getattr(reply, "content", None)
+    if isinstance(answer_text, list):
+        answer_text = "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in answer_text
+        )
+    elif not isinstance(answer_text, str):
+        answer_text = str(reply)
+
+    question = ""
+
+    for message in state["messages"]:
+        if message.type == "human":
+            question = message.content
+            break
+
+    if state["route"] == "filings":
+        evidence = state.get("sources", [])
+    elif state["route"] == "market":
+        evidence = state.get("tool_results", [])
+    else:
+        evidence = []
+            
+    if not answer_text.strip():
+        return {
+        "messages": [reply]
+    }
+        
+    grounding_eval = evaluate_answer_with_llm(
+        question=question,
+        answer=answer_text,
+        evidence=evidence,
+    )
+    
+    get_stream_writer()(
+        {
+            "type": "evaluation",
+            "kind": "answer_grounding",
+            "metrics": grounding_eval,
+        }
+    )
+
+    return {
+        "messages": [reply],
+        "evaluation": {
+            **state.get("evaluation", {}),
+            "judge": grounding_eval,
+        },
+    }
+    
 
 TOOL_REGISTRY = {t.name: t for t in MARKET_TOOLS}
 
 def tools(state: DeskState) -> dict:
     announce("tools")
     writer = get_stream_writer()
-    results = []
+    tool_messages = []
+    tool_results = []
+
     for call in state["messages"][-1].tool_calls:
-        writer({"type": "tool_call", "name": call["name"], "args": call["args"]})
+        writer({
+            "type": "tool_call",
+            "name": call["name"],
+            "args": call["args"],
+        })
+
         payload = TOOL_REGISTRY[call["name"]].invoke(call["args"])
-        results.append(ToolMessage(content=json.dumps(payload), tool_call_id=call["id"]))
-    return {"messages": results}
+
+        tool_results.append(payload)
+
+        tool_messages.append(
+            ToolMessage(
+                content=json.dumps(payload),
+                tool_call_id=call["id"],
+            )
+        )
+
+    return {
+        "messages": tool_messages,
+        "tool_results": tool_results,
+    }
 
 builder = StateGraph(DeskState)
 builder.add_node("router", router)
