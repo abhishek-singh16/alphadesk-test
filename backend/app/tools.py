@@ -7,6 +7,7 @@ import chromadb
 from chromadb.config import Settings
 import yfinance as yf
 from langchain_core.tools import tool
+import logging,sys
 
 _filings = None
 
@@ -54,12 +55,24 @@ def get_price_history(ticker: str, period: str = "1mo") -> dict:
 def get_quotes(ticker: str) -> dict:
     "Live Quote for a stock ticker."
     try:
-        info = yf.Ticker(ticker).fast_info
-        price, prev = info["lastPrice"], info["previousClose"]
+        t = yf.Ticker(ticker)
+        try:
+            info = t.fast_info
+            price, prev = info["lastPrice"], info["previousClose"]
+            currency = info["currency"]
+        except (KeyError, Exception):
+            # fast_info can break silently when Yahoo changes response shape;
+            # .info is slower but more stable as a fallback.
+            info = t.info
+            price = info.get("currentPrice") or info.get("regularMarketPrice")
+            prev = info.get("previousClose")
+            currency = info.get("currency", "USD")
+            if price is None or prev is None:
+                raise ValueError(f"No price data available for '{ticker}'")
         return {
             "ticker": ticker,
             "price": round(price, 2),
-            "currency": info["currency"],
+            "currency": currency,
             "change": round(price - prev, 2),
             "percent_change": round((price - prev) / prev * 100, 2),
         }
