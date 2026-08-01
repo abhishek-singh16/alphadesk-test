@@ -44,12 +44,18 @@ renderer per type):
 
 | Event       | Since | Payload    | Meaning                                          |
 | ----------- | ----- | ---------- | ------------------------------------------------ |
-| `token`     | S01   | `text`     | One chunk of assistant text — append it.         |
 | `done`      | S01   | —          | The stream is complete.                          |
 | `error`     | S01   | `message`  | Something failed; render it, stop.               |
 | `node`      | S02   | `name`     | A graph node started — the pipeline, visible.    |
 | `interrupt` | S02   | `question` | The graph paused for a human answer (see below). |
 | `citations` | S03   | `items`    | The numbered evidence the answer cites as `[n]`: `[{id, source, page, snippet}]`. |
+| `message`   | S03   | `text`     | The full, guardrail-approved reply, sent once the graph finishes — the client's only source of assistant text. |
+| `blocked`   | guardrails | `stage`, `reason` | A guardrail (`input`, `execution`, or `output`) rejected something; `message` carries the safe text shown instead. |
+
+Note: replies are no longer streamed token-by-token. The `respond` node's
+draft answer is checked by an output guardrail (`app/guardrails.py`) before
+anything is sent to the client, so `message` always carries the final,
+approved text in one piece rather than tokens arriving live.
 
 Since Session 02 every request also carries a client-generated `thread_id` —
 the conversation state lives server-side in the graph checkpointer, keyed by

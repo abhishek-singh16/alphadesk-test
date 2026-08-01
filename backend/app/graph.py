@@ -12,7 +12,7 @@ import json
 import os
 from typing import Annotated, Literal, Optional
 
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 
 # Old tutorials import MemorySaver — renamed InMemorySaver in 1.x, same class.
@@ -24,8 +24,14 @@ from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
+from .guardrails import check_input, check_output, check_tool_call
 from .llm import SYSTEM_PROMPT  # the Session 01 prompt survives the rearchitecture
 from .tools import MARKET_TOOLS, search_filings
+
+from .eval import (
+    evaluate_answer_with_llm,
+    evaluate_search_recall,
+)
 
 
 class DeskState(TypedDict):
@@ -38,7 +44,10 @@ class DeskState(TypedDict):
     # Plain fields (no reducer) are *replaced* on write — but they still
     # persist across turns in the checkpoint, so the router clears this one.
     sources: list
-
+    blocked: bool
+    eval_relevant: list
+    evaluation: dict
+    tool_results: list
 
 class RouteDecision(BaseModel):
     """Structured output for the router: the model must pick a label, not prose."""
@@ -77,6 +86,18 @@ def announce(name: str) -> None:
     get_stream_writer()({"type": "node", "name": name})
 
 
+def input_guardrail(state: DeskState) -> dict:
+    announce("input_guardrail")
+    result = check_input(state["messages"][-1].content)
+    if result.allowed:
+        return {"blocked": False}
+    get_stream_writer()({"type": "blocked", "stage": "input", "reason": result.reason})
+    return {
+        "blocked": True,
+        "messages": [AIMessage(content=result.reason or "I can't help with that request.")],
+    }
+
+
 def router(state: DeskState) -> dict:
     announce("router")
     decision = llm.with_structured_output(RouteDecision).invoke(
@@ -87,6 +108,8 @@ def router(state: DeskState) -> dict:
         "route": decision.route,
         "clarifying_question": decision.clarifying_question,
         "sources": [],
+        "eval_relevant": state.get("eval_relevant", []),
+        "evaluation": state.get("evaluation", {}),
     }
 
 
@@ -133,9 +156,9 @@ def retrieve(state: DeskState) -> dict:
     query = state["messages"][-1].content
     hits = search_filings(query, k=10)
     sources = rerank(query, hits) if RERANK_ENABLED and hits else hits[:4]
+    #state["eval_relevant"] = benchmark["relevant"]
+    
     if sources:
-        # The frontend numbers its citation chips from this event; respond()
-        # below is instructed to cite with the same numbers. One vocabulary.
         get_stream_writer()(
             {
                 "type": "citations",
@@ -145,7 +168,25 @@ def retrieve(state: DeskState) -> dict:
                 ],
             }
         )
-    return {"sources": sources}
+
+    retrieval_eval = {}
+    print("eval_relevant =", state.get("eval_relevant"))
+    retrieval_eval = evaluate_search_recall(
+        sources,
+        state.get("eval_relevant", []),
+        k=4,
+    )
+
+    get_stream_writer()({
+        "type": "evaluation",
+        "kind": "retrieval",
+        "metrics": retrieval_eval,
+    })
+
+    return {
+        "sources": sources,
+        "evaluation": {**state.get("evaluation", {}), "retrieval": retrieval_eval},
+    }
 
 
 GROUNDED_RULES = (
@@ -167,11 +208,9 @@ def respond(state: DeskState) -> dict:
     model = llm
     if state["route"] == "market":
         model = llm.bind_tools(MARKET_TOOLS)
-        #bind_tools attach all of tools JSON schema to the request.
-        #Function calling protocol is not magic it's literally binding the tools to the model request.
+
     announce("respond")
-    # 'market' lands here un-augmented for now: the routing skeleton comes
-    # before the capability (live tools arrive in Session 04).
+
     system = SYSTEM_PROMPT
     if state["route"] == "filings":
         if state.get("sources"):
@@ -182,28 +221,129 @@ def respond(state: DeskState) -> dict:
             system = f"{SYSTEM_PROMPT}\n\n{GROUNDED_RULES}\n\nSOURCES:\n{numbered}"
         else:
             system = f"{SYSTEM_PROMPT}\n\n{NO_SOURCES_NOTE}"
+
     reply = model.invoke([("system", system), *state["messages"]])
+    if reply.tool_calls:
+        return {
+        "messages": [reply]
+    }
+
+    answer_text = getattr(reply, "content", None)
+    if isinstance(answer_text, list):
+        answer_text = "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in answer_text
+        )
+    elif not isinstance(answer_text, str):
+        answer_text = str(reply)
+
+    question = ""
+
+    for message in state["messages"]:
+        if message.type == "human":
+            question = message.content
+            break
+
+    if state["route"] == "filings":
+        evidence = state.get("sources", [])
+    elif state["route"] == "market":
+        evidence = state.get("tool_results", [])
+    else:
+        evidence = []
+            
+    if not answer_text.strip():
+        return {
+        "messages": [reply]
+    }
+        
+    grounding_eval = evaluate_answer_with_llm(
+        question=question,
+        answer=answer_text,
+        evidence=evidence,
+    )
+    
+    get_stream_writer()(
+        {
+            "type": "evaluation",
+            "kind": "answer_grounding",
+            "metrics": grounding_eval,
+        }
+    )
+
+    return {
+        "messages": [reply],
+        "evaluation": {
+            **state.get("evaluation", {}),
+            "judge": grounding_eval,
+        },
+    }
+  
+    
+
+
+def output_guardrail(state: DeskState) -> dict:
+    announce("output_guardrail")
+    reply = state["messages"][-1]
+    result = check_output(reply.content)
+    if not result.allowed:
+        get_stream_writer()({"type": "blocked", "stage": "output", "reason": result.reason})
+        reply.content = result.reason or "I can't share that response."
+    # Always return the (possibly rewritten) message, same id, so main.py's
+    # "updates" stream always has the approved text to hand to the client —
+    # nothing downstream ever sees the pre-guardrail draft.
     return {"messages": [reply]}
+
 
 TOOL_REGISTRY = {t.name: t for t in MARKET_TOOLS}
 
 def tools(state: DeskState) -> dict:
     announce("tools")
     writer = get_stream_writer()
-    results = []
+    tool_messages = []
+    tool_results = []
+
     for call in state["messages"][-1].tool_calls:
-        writer({"type": "tool_call", "name": call["name"], "args": call["args"]})
-        payload = TOOL_REGISTRY[call["name"]].invoke(call["args"])
-        results.append(ToolMessage(content=json.dumps(payload), tool_call_id=call["id"]))
-    return {"messages": results}
+        writer({
+            "type": "tool_call",
+            "name": call["name"],
+            "args": call["args"],
+        })
+
+        check = check_tool_call(call["name"], call["args"])
+        if check.allowed:
+            payload = TOOL_REGISTRY[call["name"]].invoke(call["args"])
+
+        else:
+            writer({"type": "blocked", "stage": "execution", "reason": check.reason})
+            payload = {"error": check.reason}
+        tool_results.append(payload)
+
+        tool_messages.append(
+            ToolMessage(
+                content=json.dumps(payload),
+                tool_call_id=call["id"],
+            )
+        )
+
+    return {
+        "messages": tool_messages,
+        "tool_results": tool_results,
+    }
 
 builder = StateGraph(DeskState)
+builder.add_node("input_guardrail", input_guardrail)
 builder.add_node("router", router)
 builder.add_node("clarify", clarify)
 builder.add_node("retrieve", retrieve)
 builder.add_node("respond", respond)
+builder.add_node("output_guardrail", output_guardrail)
 builder.add_node("tools", tools)
-builder.add_edge(START, "router")
+builder.add_edge(START, "input_guardrail")
+builder.add_conditional_edges(
+    "input_guardrail",
+    lambda state: "blocked" if state["blocked"] else "router",
+    {"blocked": END, "router": "router"},
+)
 builder.add_conditional_edges(
     "router",
     lambda state: state["route"],
@@ -218,10 +358,11 @@ builder.add_edge("clarify", "respond")
 builder.add_edge("retrieve", "respond")
 builder.add_conditional_edges(
     "respond",
-    lambda state: "tools" if state["messages"][-1].tool_calls else END,
-    {"tools": "tools", END:END},
+    lambda state: "tools" if state["messages"][-1].tool_calls else "output_guardrail",
+    {"tools": "tools", "output_guardrail": "output_guardrail"},
 )
 builder.add_edge("tools", "respond")
+builder.add_edge("output_guardrail", END)
 
 # In-process checkpoints: perfect for a classroom, gone on restart.
 # Session 07 swaps in a durable checkpointer without touching the graph.
