@@ -43,31 +43,34 @@ async def stream_graph(graph_input, thread_id: str):
     # thread_id selects which checkpointed conversation this run extends —
     # state lives server-side in the checkpointer, not in the request.
     config = {"configurable": {"thread_id": thread_id}}
-    answer_parts: list[str] = []
+    final_text: str | None = None
     try:
         # LangGraph's current streaming API: astream with multiple modes.
-        #   "messages" → per-token chunks from LLM calls inside nodes
-        #   "custom"   → whatever nodes write via get_stream_writer()
-        #   "updates"  → node results; also where an interrupt surfaces
+        #   "custom"  → whatever nodes write via get_stream_writer()
+        #   "updates" → node results; also where an interrupt surfaces
+        #
+        # No "messages" mode here: the model's tokens are generated inside
+        # the respond node, before output_guardrail has had a chance to
+        # check (and possibly rewrite) the reply. Forwarding those tokens
+        # live would let an unsafe draft reach the client before the
+        # guardrail ever runs. So we wait for input_guardrail/output_guardrail
+        # to hand back the approved text, then send it in one piece — a
+        # deliberate trade of live token-by-token typing for a guarantee that
+        # nothing unapproved is ever streamed out.
         async for mode, chunk in graph.astream(
-            graph_input, config, stream_mode=["messages", "custom", "updates"]
+            graph_input, config, stream_mode=["custom", "updates"]
         ):
             if mode == "custom":
                 yield event(**chunk)
-            elif mode == "messages":
-                token, meta = chunk
-                # Only the respond node's tokens are the answer; the router's
-                # structured-output call also streams here and must not leak.
-                if token.content and meta.get("langgraph_node") == "respond":
-                    answer_parts.append(token.content)
-                    yield event("token", text=token.content)
-            elif mode == "updates" and "__interrupt__" in chunk:
-                yield event("interrupt", question=chunk["__interrupt__"][0].value["question"])
-        if answer_parts:
-            # The same reply the tokens spelled out, in one piece — so a curl
-            # user (or a client that skipped the token events) can read the
-            # answer without reassembling it.
-            yield event("message", text="".join(answer_parts))
+            elif mode == "updates":
+                if "__interrupt__" in chunk:
+                    yield event("interrupt", question=chunk["__interrupt__"][0].value["question"])
+                    continue
+                node_update = chunk.get("output_guardrail") or chunk.get("input_guardrail")
+                if node_update and node_update.get("messages"):
+                    final_text = node_update["messages"][-1].content
+        if final_text is not None:
+            yield event("message", text=final_text)
         yield event("done")
     except Exception as exc:
         # A failure mid-stream must be an event, not a dead socket.

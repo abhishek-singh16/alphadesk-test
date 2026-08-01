@@ -12,7 +12,7 @@ import json
 import os
 from typing import Annotated, Literal, Optional
 
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 
 # Old tutorials import MemorySaver — renamed InMemorySaver in 1.x, same class.
@@ -24,6 +24,7 @@ from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
+from .guardrails import check_input, check_output, check_tool_call
 from .llm import SYSTEM_PROMPT  # the Session 01 prompt survives the rearchitecture
 from .tools import MARKET_TOOLS, search_filings
 
@@ -43,6 +44,7 @@ class DeskState(TypedDict):
     # Plain fields (no reducer) are *replaced* on write — but they still
     # persist across turns in the checkpoint, so the router clears this one.
     sources: list
+    blocked: bool
     eval_relevant: list
     evaluation: dict
     tool_results: list
@@ -82,6 +84,18 @@ def announce(name: str) -> None:
     # frontend renders the NodeTrail from these events. This is the visible
     # pipeline — the UI grows a layer as the architecture does.
     get_stream_writer()({"type": "node", "name": name})
+
+
+def input_guardrail(state: DeskState) -> dict:
+    announce("input_guardrail")
+    result = check_input(state["messages"][-1].content)
+    if result.allowed:
+        return {"blocked": False}
+    get_stream_writer()({"type": "blocked", "stage": "input", "reason": result.reason})
+    return {
+        "blocked": True,
+        "messages": [AIMessage(content=result.reason or "I can't help with that request.")],
+    }
 
 
 def router(state: DeskState) -> dict:
@@ -263,7 +277,22 @@ def respond(state: DeskState) -> dict:
             "judge": grounding_eval,
         },
     }
+  
     
+
+
+def output_guardrail(state: DeskState) -> dict:
+    announce("output_guardrail")
+    reply = state["messages"][-1]
+    result = check_output(reply.content)
+    if not result.allowed:
+        get_stream_writer()({"type": "blocked", "stage": "output", "reason": result.reason})
+        reply.content = result.reason or "I can't share that response."
+    # Always return the (possibly rewritten) message, same id, so main.py's
+    # "updates" stream always has the approved text to hand to the client —
+    # nothing downstream ever sees the pre-guardrail draft.
+    return {"messages": [reply]}
+
 
 TOOL_REGISTRY = {t.name: t for t in MARKET_TOOLS}
 
@@ -280,8 +309,13 @@ def tools(state: DeskState) -> dict:
             "args": call["args"],
         })
 
-        payload = TOOL_REGISTRY[call["name"]].invoke(call["args"])
+        check = check_tool_call(call["name"], call["args"])
+        if check.allowed:
+            payload = TOOL_REGISTRY[call["name"]].invoke(call["args"])
 
+        else:
+            writer({"type": "blocked", "stage": "execution", "reason": check.reason})
+            payload = {"error": check.reason}
         tool_results.append(payload)
 
         tool_messages.append(
@@ -297,12 +331,19 @@ def tools(state: DeskState) -> dict:
     }
 
 builder = StateGraph(DeskState)
+builder.add_node("input_guardrail", input_guardrail)
 builder.add_node("router", router)
 builder.add_node("clarify", clarify)
 builder.add_node("retrieve", retrieve)
 builder.add_node("respond", respond)
+builder.add_node("output_guardrail", output_guardrail)
 builder.add_node("tools", tools)
-builder.add_edge(START, "router")
+builder.add_edge(START, "input_guardrail")
+builder.add_conditional_edges(
+    "input_guardrail",
+    lambda state: "blocked" if state["blocked"] else "router",
+    {"blocked": END, "router": "router"},
+)
 builder.add_conditional_edges(
     "router",
     lambda state: state["route"],
@@ -317,10 +358,11 @@ builder.add_edge("clarify", "respond")
 builder.add_edge("retrieve", "respond")
 builder.add_conditional_edges(
     "respond",
-    lambda state: "tools" if state["messages"][-1].tool_calls else END,
-    {"tools": "tools", END:END},
+    lambda state: "tools" if state["messages"][-1].tool_calls else "output_guardrail",
+    {"tools": "tools", "output_guardrail": "output_guardrail"},
 )
 builder.add_edge("tools", "respond")
+builder.add_edge("output_guardrail", END)
 
 # In-process checkpoints: perfect for a classroom, gone on restart.
 # Session 07 swaps in a durable checkpointer without touching the graph.

@@ -58,7 +58,7 @@ def get_quotes(ticker: str) -> dict:
         t = yf.Ticker(ticker)
         try:
             info = t.fast_info
-            price, prev = info["_last_price"], info["previousClose"]
+            price, prev = info["lastPrice"], info["previousClose"]
             currency = info["currency"]
         except (KeyError, Exception):
             # fast_info can break silently when Yahoo changes response shape;
