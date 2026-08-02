@@ -67,9 +67,11 @@ async def stream_graph(graph_input, thread_id: str):
                         question=chunk["__interrupt__"][0].value["question"]
                     )
 
-                # Final approved answer
-                elif "output_guardrail" in chunk:
-                    update = chunk["output_guardrail"]
+                # Final approved answer, or a message explaining why the
+                # request was blocked (input guardrail short-circuits
+                # straight to END, bypassing output_guardrail entirely).
+                elif "output_guardrail" in chunk or "input_guardrail" in chunk:
+                    update = chunk.get("output_guardrail") or chunk.get("input_guardrail")
 
                     messages = update.get("messages", [])
 
