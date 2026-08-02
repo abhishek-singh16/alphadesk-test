@@ -1,0 +1,11 @@
+.git
+.venv
+backend/.venv
+**/__pycache__
+**/*.py[cod]
+**/node_modules
+frontend/dist
+dist
+.env
+backend/.env
+npm-debug.log*

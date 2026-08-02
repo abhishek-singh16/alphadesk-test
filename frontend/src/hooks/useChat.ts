@@ -14,8 +14,10 @@ export interface ChatMessage {
   interrupt?: string; // a pending human-in-the-loop question
 }
 
-// Override with VITE_API_BASE if your backend runs on another port.
-const API = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
+// Local Vite development uses the API port directly. In a production Docker
+// deployment the API and UI share one origin, so relative API paths work on
+// Railway (and any other host) without baking a deployment URL into the build.
+const API = import.meta.env.VITE_API_BASE ?? (import.meta.env.DEV ? "http://localhost:8000" : "");
 
 export function useChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);

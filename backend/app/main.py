@@ -5,12 +5,14 @@ The SSE event vocabulary grows one session at a time (see README,
 """
 
 from dotenv import load_dotenv
+from pathlib import Path
 
 load_dotenv()  # backend/.env — secrets stay out of code and out of git
 
 from fastapi import FastAPI  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import StreamingResponse  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
 from langgraph.types import Command  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
@@ -100,3 +102,10 @@ def resume(req: ResumeRequest) -> StreamingResponse:
         stream_graph(Command(resume=req.answer), req.thread_id),
         media_type="text/event-stream",
     )
+
+
+# The Docker image places Vite's production output here. Keep the mount
+# conditional so local development continues to use the Vite dev server.
+frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if frontend_dist.is_dir():
+    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
