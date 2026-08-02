@@ -24,6 +24,10 @@ app = FastAPI(title="AlphaDesk")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
+    # Vite increments the port when 5173 is already occupied. Keep local
+    # development working on that fallback port (and when opened via
+    # 127.0.0.1) without allowing non-local origins.
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):517\d+$",
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -40,42 +44,45 @@ class ResumeRequest(BaseModel):
 
 
 async def stream_graph(graph_input, thread_id: str):
-    # thread_id selects which checkpointed conversation this run extends —
-    # state lives server-side in the checkpointer, not in the request.
     config = {"configurable": {"thread_id": thread_id}}
-    final_text: str | None = None
+
     try:
-        # LangGraph's current streaming API: astream with multiple modes.
-        #   "custom"  → whatever nodes write via get_stream_writer()
-        #   "updates" → node results; also where an interrupt surfaces
-        #
-        # No "messages" mode here: the model's tokens are generated inside
-        # the respond node, before output_guardrail has had a chance to
-        # check (and possibly rewrite) the reply. Forwarding those tokens
-        # live would let an unsafe draft reach the client before the
-        # guardrail ever runs. So we wait for input_guardrail/output_guardrail
-        # to hand back the approved text, then send it in one piece — a
-        # deliberate trade of live token-by-token typing for a guarantee that
-        # nothing unapproved is ever streamed out.
         async for mode, chunk in graph.astream(
-            graph_input, config, stream_mode=["custom", "updates"]
+            graph_input,
+            config,
+            stream_mode=["custom", "updates"]
         ):
+
             if mode == "custom":
                 yield event(**chunk)
-            elif mode == "updates":
-                if "__interrupt__" in chunk:
-                    yield event("interrupt", question=chunk["__interrupt__"][0].value["question"])
-                    continue
-                node_update = chunk.get("output_guardrail") or chunk.get("input_guardrail")
-                if node_update and node_update.get("messages"):
-                    final_text = node_update["messages"][-1].content
-        if final_text is not None:
-            yield event("message", text=final_text)
-        yield event("done")
-    except Exception as exc:
-        # A failure mid-stream must be an event, not a dead socket.
-        yield event("error", message=str(exc))
 
+            elif mode == "updates":
+
+                # HITL interrupt
+                if "__interrupt__" in chunk:
+                    yield event(
+                        "interrupt",
+                        question=chunk["__interrupt__"][0].value["question"]
+                    )
+
+                # Final approved answer
+                elif "output_guardrail" in chunk:
+                    update = chunk["output_guardrail"]
+
+                    messages = update.get("messages", [])
+
+                    if messages:
+                        reply = messages[-1]
+
+                        yield event(
+                            "token",
+                            text=reply.content
+                        )
+
+        yield event("done")
+
+    except Exception as exc:
+        yield event("error", message=str(exc))
 
 @app.post("/api/chat")
 def chat(req: ChatRequest) -> StreamingResponse:
