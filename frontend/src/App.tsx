@@ -3,6 +3,7 @@
 // never does — that stability is part of the product's story.
 // Introduced in Session 01.
 import ChatWindow from "./components/ChatWindow";
+import ThemeToggle from "./components/ThemeToggle";
 
 // Bumped each session as a new architectural layer lands.
 const SESSION_LABEL = "Session 02";
@@ -16,9 +17,12 @@ export default function App() {
             ALPHADESK
             <span className="mt-1.5 block h-px w-full bg-gold" aria-hidden />
           </h1>
-          <span className="text-[11px] uppercase tracking-[0.25em] text-muted">
-            {SESSION_LABEL}
-          </span>
+          <div className="flex items-center gap-3">
+            <span className="text-[11px] uppercase tracking-[0.25em] text-muted">
+              {SESSION_LABEL}
+            </span>
+            <ThemeToggle />
+          </div>
         </div>
       </header>
 

@@ -24,17 +24,23 @@ WORKDIR /app
 COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install -r backend/requirements.txt
 
-# Application code, prebuilt Chroma index, and bundled UI. The API mounts this
-# UI at / in production.
+# Application code, bundled UI, and source filings. The API mounts the UI
+# at / in production.
 COPY backend/ ./backend/
 COPY data/ ./data/
 COPY --from=frontend /web/dist ./backend/frontend/dist
 
 # Run as a non-root user.
-RUN useradd --create-home --uid 10001 appuser
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
 USER appuser
 
+# Build the Chroma index from the committed filings at image-build time —
+# backend/chroma_db is gitignored (it's a generated artifact), so it has to
+# be rebuilt here rather than copied in. Runs as appuser so the embedding
+# model's download cache lands under /home/appuser and is reused at runtime
+# instead of re-downloading on the container's first query.
 WORKDIR /app/backend
+RUN python -m app.ingest ../data/filings
 EXPOSE 8000
 
 # Railway injects $PORT at runtime; 8000 is the local default.
