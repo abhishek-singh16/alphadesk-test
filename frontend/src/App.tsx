@@ -5,9 +5,6 @@
 import ChatWindow from "./components/ChatWindow";
 import ThemeToggle from "./components/ThemeToggle";
 
-// Bumped each session as a new architectural layer lands.
-const SESSION_LABEL = "Session 02";
-
 export default function App() {
   return (
     <div className="flex h-dvh flex-col bg-obsidian font-sans text-bone antialiased">
@@ -19,7 +16,7 @@ export default function App() {
           </h1>
           <div className="flex items-center gap-3">
             <span className="text-[11px] uppercase tracking-[0.25em] text-muted">
-              {SESSION_LABEL}
+              <em className="italic">Beta</em> 1.0
             </span>
             <ThemeToggle />
           </div>

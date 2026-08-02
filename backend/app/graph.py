@@ -62,18 +62,25 @@ class RouteDecision(BaseModel):
 
 
 llm = ChatOpenAI(model=os.environ["OPENAI_MODEL"])
+# Routing is a classification decision, not a creative one — temperature=0
+# keeps it deterministic instead of flip-flopping between 'filings' and
+# 'general' across identical-looking questions.
+router_llm = ChatOpenAI(model=os.environ["OPENAI_MODEL"], temperature=0)
 
 ROUTER_PROMPT = (
     "You route requests arriving at an equity research desk. Classify the "
     "user's LATEST message given the conversation so far:\n"
-    "- 'filings': anything a company's annual report or 10-K would answer — "
-    "reported financials and revenue, segments, dividends, risk factors, "
-    "strategy, policies. When torn between filings and general for a "
-    "company-specific fact, pick filings: the retrieval layer says honestly "
-    "whether the documents cover it.\n"
+    "- 'filings': anything a NAMED COMPANY's annual report or 10-K would "
+    "answer — reported financials and revenue, segments, dividends, risk "
+    "factors, strategy, policies, or how a trend/technology (e.g. AI) "
+    "affects that company specifically. If a company is named — even one "
+    "you don't recognize — and the question ties a topic to that company, "
+    "pick filings; never answer from general knowledge instead just because "
+    "the company is unfamiliar. The retrieval layer honestly reports back "
+    "if nothing is indexed for it.\n"
     "- 'market': live prices, quotes, today's moves, recent news.\n"
-    "- 'general': definitions, concepts, anything answerable without "
-    "documents or live data.\n"
+    "- 'general': definitions, concepts, or industry-wide questions with NO "
+    "named company attached.\n"
     "- 'unclear': only when the message cannot be acted on at all without one "
     "clarifying question (e.g. an ambiguous reference like 'the other one')."
 )
@@ -100,7 +107,7 @@ def input_guardrail(state: DeskState) -> dict:
 
 def router(state: DeskState) -> dict:
     announce("router")
-    decision = llm.with_structured_output(RouteDecision).invoke(
+    decision = router_llm.with_structured_output(RouteDecision).invoke(
         [("system", ROUTER_PROMPT), *state["messages"]]
     )
     # sources=[] : last turn's evidence must not leak into this turn.
