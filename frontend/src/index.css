@@ -1,0 +1,46 @@
+/* index.css — the design system as code: Tailwind v4 tokens plus the one
+   global animation (the streaming caret). Introduced in Session 01. */
+@import "tailwindcss";
+
+/* AlphaDesk design tokens — locked brand constraints.
+   Obsidian ground, champagne-gold accent (never body text), bone text.
+   Green/red are reserved exclusively for price deltas. */
+@theme {
+  --font-sans: "Inter Tight", ui-sans-serif, system-ui, sans-serif;
+  --color-obsidian: #0a0a0a;
+  --color-surface: #111113;
+  --color-surface-2: #17171a;
+  --color-hairline: #26262b;
+  --color-gold: #c9a961;
+  --color-bone: #f5f5f5;
+  --color-muted: #9a9a9f;
+  --color-up: #4ade80;
+  --color-down: #f87171;
+}
+
+/* Streaming caret: a thin gold bar pulsing while tokens arrive. */
+@keyframes caret-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.15;
+  }
+}
+
+.caret {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--color-gold);
+  animation: caret-pulse 1s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .caret {
+    animation: none;
+  }
+}

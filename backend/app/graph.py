@@ -222,13 +222,14 @@ def respond(state: DeskState) -> dict:
         else:
             system = f"{SYSTEM_PROMPT}\n\n{NO_SOURCES_NOTE}"
 
-    reply = model.invoke([("system", system), *state["messages"]])
+    reply = model.with_config(tags=["user_answer"]).invoke([("system", system), *state["messages"]])
     if reply.tool_calls:
         return {
         "messages": [reply]
     }
 
     answer_text = getattr(reply, "content", None)
+    print("answer_text_1 =", answer_text)
     if isinstance(answer_text, list):
         answer_text = "".join(
             part.get("text", "") if isinstance(part, dict) else str(part)
@@ -238,30 +239,33 @@ def respond(state: DeskState) -> dict:
         answer_text = str(reply)
 
     question = ""
-
+    print("answer_text_2 =", answer_text)
     for message in state["messages"]:
         if message.type == "human":
             question = message.content
             break
 
+    print("answer_text_3 =", answer_text)
     if state["route"] == "filings":
         evidence = state.get("sources", [])
     elif state["route"] == "market":
         evidence = state.get("tool_results", [])
     else:
         evidence = []
-            
+    print("answer_text_4 =", answer_text)
+    print("Evidence =", evidence)
     if not answer_text.strip():
         return {
         "messages": [reply]
     }
-        
+    print("answer_text_5 =", answer_text)
+    print("reply =", [reply])
     grounding_eval = evaluate_answer_with_llm(
         question=question,
         answer=answer_text,
         evidence=evidence,
     )
-    
+    print("grounding_eval =", grounding_eval)
     get_stream_writer()(
         {
             "type": "evaluation",
